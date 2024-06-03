@@ -229,6 +229,8 @@ public:
   /// command-line options will get checked.
   unsigned DisableAllCheckers : 1;
 
+  unsigned EnableClassHelperInjection : 1;
+
   unsigned ShowCheckerHelp : 1;
   unsigned ShowCheckerHelpAlpha : 1;
   unsigned ShowCheckerHelpDeveloper : 1;
@@ -299,9 +301,10 @@ public:
   }
 
   AnalyzerOptions()
-      : DisableAllCheckers(false), ShowCheckerHelp(false),
-        ShowCheckerHelpAlpha(false), ShowCheckerHelpDeveloper(false),
-        ShowCheckerOptionList(false), ShowCheckerOptionAlphaList(false),
+      : DisableAllCheckers(false), EnableClassHelperInjection(false),
+        ShowCheckerHelp(false), ShowCheckerHelpAlpha(false),
+        ShowCheckerHelpDeveloper(false), ShowCheckerOptionList(false),
+        ShowCheckerOptionAlphaList(false),
         ShowCheckerOptionDeveloperList(false), ShowEnabledCheckerList(false),
         ShowConfigOptionsList(false), AnalyzeAll(false),
         AnalyzerDisplayProgress(false), AnalyzeNestedBlocks(false),
