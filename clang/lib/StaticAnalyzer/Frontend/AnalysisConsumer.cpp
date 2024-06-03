@@ -15,6 +15,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Analysis/Analyses/LiveVariables.h"
 #include "clang/Analysis/CFG.h"
@@ -23,6 +24,7 @@
 #include "clang/Analysis/MacroExpansionContext.h"
 #include "clang/Analysis/PathDiagnostic.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Basic/Specifiers.h"
 #include "clang/CrossTU/CrossTranslationUnit.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Lex/Preprocessor.h"
@@ -35,6 +37,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/FileSystem.h"
@@ -99,6 +102,7 @@ public:
   /// The local declaration to all declarations ratio might be very small when
   /// working with a PCH file.
   SetOfDecls LocalTUDecls;
+  SetOfDecls ClassHelpMethods;
 
   MacroExpansionContext MacroExpansions;
 
@@ -576,6 +580,81 @@ void AnalysisConsumer::HandleTranslationUnit(ASTContext &C) {
     return;
   }
 
+  if (Opts->EnableClassHelperInjection) {
+    // patch current class body by adding following member method:
+    // void helper() {
+    //  <CLASS_NAME>().Init();
+    // }
+
+    llvm::SmallVector<Decl *> fakeMethods;
+    for (auto *D : LocalTUDecls) {
+      if (auto *RD = dynamic_cast<CXXRecordDecl *>(D)) {
+        // TODO: Currently, we only support default ctor.
+        CXXConstructorDecl *CD{};
+        for (auto *ctor : RD->ctors()) {
+          if (ctor->isDefaultConstructor()) {
+            CD = ctor;
+            break;
+          }
+        }
+        if (!CD)
+          continue;
+
+        // check if current class has "Init" member function.
+        CXXMethodDecl *InitDecl{};
+        llvm::for_each(RD->methods(), [&](CXXMethodDecl *MD) {
+          if (MD->getIdentifier() && MD->getName() == "Init" and
+              MD->getNumParams() == 0) {
+            InitDecl = MD;
+          }
+        });
+        if (!InitDecl)
+          continue;
+
+        // if (CD->getNumParams() != 0)
+        //   continue;
+        // get record type
+
+        auto *subExpr = CXXTemporaryObjectExpr::Create(
+            C, CD, C.getRecordType(RD), CD->getTypeSourceInfo(), {}, {}, false,
+            false, false, false);
+
+        auto *temp = CXXTemporary::Create(C, RD->getDestructor());
+
+        CXXBindTemporaryExpr *bind =
+            CXXBindTemporaryExpr::Create(C, temp, subExpr);
+
+        MaterializeTemporaryExpr *MTE =
+            new (C) MaterializeTemporaryExpr(C.getRecordType(RD), bind, false);
+
+        MemberExpr *ME = MemberExpr::Create(
+            C, MTE, false, {}, {}, {}, InitDecl,
+            DeclAccessPair::make(InitDecl, clang::AS_public), {}, nullptr,
+            C.BoundMemberTy, VK_PRValue, OK_Ordinary, NOUR_None);
+
+        CXXMemberCallExpr *MCE = CXXMemberCallExpr::Create(
+            C, ME, {}, InitDecl->getReturnType(), VK_PRValue, {}, {});
+
+        ExprWithCleanups *clean = ExprWithCleanups::Create(C, MCE, false, {});
+
+        CompoundStmt *stmt = CompoundStmt::Create(C, {clean}, {}, {});
+
+        // Change HD into static member function.
+        auto *HD = CXXMethodDecl::Create(
+            C, RD, {}, /* DeclarationNameInfo */ {},
+            C.getFunctionType(C.VoidTy, {}, {}), {}, CD->getStorageClass(),
+            false, false, ConstexprSpecKind::Unspecified, {});
+
+        HD->setBody(stmt);
+
+        // HD->dump();
+
+        RD->addDecl(HD);
+        ClassHelpMethods.emplace_back(HD);
+      }
+    }
+  }
+
   // Otherwise, just run the analysis.
   runAnalysisOnTranslationUnit(C);
 
@@ -610,6 +689,10 @@ AnalysisConsumer::getModeForDecl(Decl *D, AnalysisMode Mode) {
     SourceLocation SL = Body ? Body->getBeginLoc() : D->getLocation();
     return SM.getExpansionLoc(SL);
   }(D);
+
+  // Fix helper methods.
+  if (llvm::find(ClassHelpMethods, D) != ClassHelpMethods.end())
+    return Mode;
 
   // Ignore system headers.
   if (Loc.isInvalid() || SM.isInSystemHeader(Loc))
