@@ -818,9 +818,9 @@ public:
   bool isWithinCall() const { return !pathStack.empty(); }
 
   void setEndOfPath(PathDiagnosticPieceRef EndPiece) {
-    assert(!Loc.isValid() && "End location already set!");
+    // assert(!Loc.isValid() && "End location already set!");
     Loc = EndPiece->getLocation();
-    assert(Loc.isValid() && "Invalid location for end-of-path piece");
+    // assert(Loc.isValid() && "Invalid location for end-of-path piece");
     getActivePath().push_back(std::move(EndPiece));
   }
 

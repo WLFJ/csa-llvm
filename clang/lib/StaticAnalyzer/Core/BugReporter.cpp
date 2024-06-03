@@ -1944,6 +1944,7 @@ static bool optimizeEdges(const PathDiagnosticConstruct &C, PathPieces &path,
 // deal with them.
 static void dropFunctionEntryEdge(const PathDiagnosticConstruct &C,
                                   PathPieces &Path) {
+  if(Path.size() == 0) return;
   const auto *FirstEdge =
       dyn_cast<PathDiagnosticControlFlowPiece>(Path.front().get());
   if (!FirstEdge)
