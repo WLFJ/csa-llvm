@@ -20,7 +20,9 @@
 #include "clang/AST/ExprObjC.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/Analysis/CodeInjector.h"
+#include "clang/Basic/LLVM.h"
 #include "clang/Basic/OperatorKinds.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
 
@@ -311,359 +313,467 @@ static CallExpr *create_call_once_lambda_call(ASTContext &C, ASTMaker M,
 ///   o.__state = 1;
 /// }
 /// \endcode
-static Stmt *create_call_once(ASTContext &C, const FunctionDecl *D) {
-  LLVM_DEBUG(llvm::dbgs() << "Generating body for call_once\n");
+// static Stmt *create_call_once(ASTContext &C, const FunctionDecl *D) {
+//   LLVM_DEBUG(llvm::dbgs() << "Generating body for call_once\n");
 
-  // We need at least two parameters.
-  if (D->param_size() < 2)
-    return nullptr;
+//   // We need at least two parameters.
+//   if (D->param_size() < 2)
+//     return nullptr;
 
-  ASTMaker M(C);
+//   ASTMaker M(C);
 
-  const ParmVarDecl *Flag = D->getParamDecl(0);
-  const ParmVarDecl *Callback = D->getParamDecl(1);
+//   const ParmVarDecl *Flag = D->getParamDecl(0);
+//   const ParmVarDecl *Callback = D->getParamDecl(1);
 
-  if (!Callback->getType()->isReferenceType()) {
-    llvm::dbgs() << "libcxx03 std::call_once implementation, skipping.\n";
-    return nullptr;
-  }
-  if (!Flag->getType()->isReferenceType()) {
-    llvm::dbgs() << "unknown std::call_once implementation, skipping.\n";
-    return nullptr;
-  }
+//   if (!Callback->getType()->isReferenceType()) {
+//     llvm::dbgs() << "libcxx03 std::call_once implementation, skipping.\n";
+//     return nullptr;
+//   }
+//   if (!Flag->getType()->isReferenceType()) {
+//     llvm::dbgs() << "unknown std::call_once implementation, skipping.\n";
+//     return nullptr;
+//   }
 
-  QualType CallbackType = Callback->getType().getNonReferenceType();
+//   QualType CallbackType = Callback->getType().getNonReferenceType();
 
-  // Nullable pointer, non-null iff function is a CXXRecordDecl.
-  CXXRecordDecl *CallbackRecordDecl = CallbackType->getAsCXXRecordDecl();
-  QualType FlagType = Flag->getType().getNonReferenceType();
-  auto *FlagRecordDecl = FlagType->getAsRecordDecl();
+//   // Nullable pointer, non-null iff function is a CXXRecordDecl.
+//   CXXRecordDecl *CallbackRecordDecl = CallbackType->getAsCXXRecordDecl();
+//   QualType FlagType = Flag->getType().getNonReferenceType();
+//   auto *FlagRecordDecl = FlagType->getAsRecordDecl();
 
-  if (!FlagRecordDecl) {
-    LLVM_DEBUG(llvm::dbgs() << "Flag field is not a record: "
-                            << "unknown std::call_once implementation, "
-                            << "ignoring the call.\n");
-    return nullptr;
-  }
+//   if (!FlagRecordDecl) {
+//     LLVM_DEBUG(llvm::dbgs() << "Flag field is not a record: "
+//                             << "unknown std::call_once implementation, "
+//                             << "ignoring the call.\n");
+//     return nullptr;
+//   }
 
-  // We initially assume libc++ implementation of call_once,
-  // where the once_flag struct has a field `__state_`.
-  ValueDecl *FlagFieldDecl = M.findMemberField(FlagRecordDecl, "__state_");
+//   // We initially assume libc++ implementation of call_once,
+//   // where the once_flag struct has a field `__state_`.
+//   ValueDecl *FlagFieldDecl = M.findMemberField(FlagRecordDecl, "__state_");
 
-  // Otherwise, try libstdc++ implementation, with a field
-  // `_M_once`
-  if (!FlagFieldDecl) {
-    FlagFieldDecl = M.findMemberField(FlagRecordDecl, "_M_once");
-  }
+//   // Otherwise, try libstdc++ implementation, with a field
+//   // `_M_once`
+//   if (!FlagFieldDecl) {
+//     FlagFieldDecl = M.findMemberField(FlagRecordDecl, "_M_once");
+//   }
 
-  if (!FlagFieldDecl) {
-    LLVM_DEBUG(llvm::dbgs() << "No field _M_once or __state_ found on "
-                            << "std::once_flag struct: unknown std::call_once "
-                            << "implementation, ignoring the call.");
-    return nullptr;
-  }
+//   if (!FlagFieldDecl) {
+//     LLVM_DEBUG(llvm::dbgs() << "No field _M_once or __state_ found on "
+//                             << "std::once_flag struct: unknown std::call_once
+//                             "
+//                             << "implementation, ignoring the call.");
+//     return nullptr;
+//   }
 
-  bool isLambdaCall = CallbackRecordDecl && CallbackRecordDecl->isLambda();
-  if (CallbackRecordDecl && !isLambdaCall) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "Not supported: synthesizing body for functors when "
-               << "body farming std::call_once, ignoring the call.");
-    return nullptr;
-  }
+//   bool isLambdaCall = CallbackRecordDecl && CallbackRecordDecl->isLambda();
+//   if (CallbackRecordDecl && !isLambdaCall) {
+//     LLVM_DEBUG(llvm::dbgs()
+//                << "Not supported: synthesizing body for functors when "
+//                << "body farming std::call_once, ignoring the call.");
+//     return nullptr;
+//   }
 
-  SmallVector<Expr *, 5> CallArgs;
-  const FunctionProtoType *CallbackFunctionType;
-  if (isLambdaCall) {
+//   SmallVector<Expr *, 5> CallArgs;
+//   const FunctionProtoType *CallbackFunctionType;
+//   if (isLambdaCall) {
 
-    // Lambda requires callback itself inserted as a first parameter.
-    CallArgs.push_back(
-        M.makeDeclRefExpr(Callback,
-                          /* RefersToEnclosingVariableOrCapture=*/ true));
-    CallbackFunctionType = CallbackRecordDecl->getLambdaCallOperator()
-                               ->getType()
-                               ->getAs<FunctionProtoType>();
-  } else if (!CallbackType->getPointeeType().isNull()) {
-    CallbackFunctionType =
-        CallbackType->getPointeeType()->getAs<FunctionProtoType>();
-  } else {
-    CallbackFunctionType = CallbackType->getAs<FunctionProtoType>();
-  }
+//     // Lambda requires callback itself inserted as a first parameter.
+//     CallArgs.push_back(
+//         M.makeDeclRefExpr(Callback,
+//                           /* RefersToEnclosingVariableOrCapture=*/true));
+//     CallbackFunctionType = CallbackRecordDecl->getLambdaCallOperator()
+//                                ->getType()
+//                                ->getAs<FunctionProtoType>();
+//   } else if (!CallbackType->getPointeeType().isNull()) {
+//     CallbackFunctionType =
+//         CallbackType->getPointeeType()->getAs<FunctionProtoType>();
+//   } else {
+//     CallbackFunctionType = CallbackType->getAs<FunctionProtoType>();
+//   }
 
-  if (!CallbackFunctionType)
-    return nullptr;
+//   if (!CallbackFunctionType)
+//     return nullptr;
 
-  // First two arguments are used for the flag and for the callback.
-  if (D->getNumParams() != CallbackFunctionType->getNumParams() + 2) {
-    LLVM_DEBUG(llvm::dbgs() << "Types of params of the callback do not match "
-                            << "params passed to std::call_once, "
-                            << "ignoring the call\n");
-    return nullptr;
-  }
+//   // First two arguments are used for the flag and for the callback.
+//   if (D->getNumParams() != CallbackFunctionType->getNumParams() + 2) {
+//     LLVM_DEBUG(llvm::dbgs() << "Types of params of the callback do not match
+//     "
+//                             << "params passed to std::call_once, "
+//                             << "ignoring the call\n");
+//     return nullptr;
+//   }
 
-  // All arguments past first two ones are passed to the callback,
-  // and we turn lvalues into rvalues if the argument is not passed by
-  // reference.
-  for (unsigned int ParamIdx = 2; ParamIdx < D->getNumParams(); ParamIdx++) {
-    const ParmVarDecl *PDecl = D->getParamDecl(ParamIdx);
-    assert(PDecl);
-    if (CallbackFunctionType->getParamType(ParamIdx - 2)
-                .getNonReferenceType()
-                .getCanonicalType() !=
-            PDecl->getType().getNonReferenceType().getCanonicalType()) {
-      LLVM_DEBUG(llvm::dbgs() << "Types of params of the callback do not match "
-                              << "params passed to std::call_once, "
-                              << "ignoring the call\n");
-      return nullptr;
-    }
-    Expr *ParamExpr = M.makeDeclRefExpr(PDecl);
-    if (!CallbackFunctionType->getParamType(ParamIdx - 2)->isReferenceType()) {
-      QualType PTy = PDecl->getType().getNonReferenceType();
-      ParamExpr = M.makeLvalueToRvalue(ParamExpr, PTy);
-    }
-    CallArgs.push_back(ParamExpr);
-  }
+//   // All arguments past first two ones are passed to the callback,
+//   // and we turn lvalues into rvalues if the argument is not passed by
+//   // reference.
+//   for (unsigned int ParamIdx = 2; ParamIdx < D->getNumParams(); ParamIdx++) {
+//     const ParmVarDecl *PDecl = D->getParamDecl(ParamIdx);
+//     assert(PDecl);
+//     if (CallbackFunctionType->getParamType(ParamIdx - 2)
+//             .getNonReferenceType()
+//             .getCanonicalType() !=
+//         PDecl->getType().getNonReferenceType().getCanonicalType()) {
+//       LLVM_DEBUG(llvm::dbgs() << "Types of params of the callback do not
+//       match "
+//                               << "params passed to std::call_once, "
+//                               << "ignoring the call\n");
+//       return nullptr;
+//     }
+//     Expr *ParamExpr = M.makeDeclRefExpr(PDecl);
+//     if (!CallbackFunctionType->getParamType(ParamIdx - 2)->isReferenceType())
+//     {
+//       QualType PTy = PDecl->getType().getNonReferenceType();
+//       ParamExpr = M.makeLvalueToRvalue(ParamExpr, PTy);
+//     }
+//     CallArgs.push_back(ParamExpr);
+//   }
 
-  CallExpr *CallbackCall;
-  if (isLambdaCall) {
+//   CallExpr *CallbackCall;
+//   if (isLambdaCall) {
 
-    CallbackCall = create_call_once_lambda_call(C, M, Callback,
-                                                CallbackRecordDecl, CallArgs);
-  } else {
+//     CallbackCall = create_call_once_lambda_call(C, M, Callback,
+//                                                 CallbackRecordDecl,
+//                                                 CallArgs);
+//   } else {
 
-    // Function pointer case.
-    CallbackCall = create_call_once_funcptr_call(C, M, Callback, CallArgs);
-  }
+//     // Function pointer case.
+//     CallbackCall = create_call_once_funcptr_call(C, M, Callback, CallArgs);
+//   }
 
-  DeclRefExpr *FlagDecl =
-      M.makeDeclRefExpr(Flag,
-                        /* RefersToEnclosingVariableOrCapture=*/true);
+//   DeclRefExpr *FlagDecl =
+//       M.makeDeclRefExpr(Flag,
+//                         /* RefersToEnclosingVariableOrCapture=*/true);
 
+//   MemberExpr *Deref = M.makeMemberExpression(FlagDecl, FlagFieldDecl);
+//   assert(Deref->isLValue());
+//   QualType DerefType = Deref->getType();
 
-  MemberExpr *Deref = M.makeMemberExpression(FlagDecl, FlagFieldDecl);
-  assert(Deref->isLValue());
-  QualType DerefType = Deref->getType();
+//   // Negation predicate.
+//   UnaryOperator *FlagCheck = UnaryOperator::Create(
+//       C,
+//       /* input=*/
+//       M.makeImplicitCast(M.makeLvalueToRvalue(Deref, DerefType), DerefType,
+//                          CK_IntegralToBoolean),
+//       /* opc=*/UO_LNot,
+//       /* QualType=*/C.IntTy,
+//       /* ExprValueKind=*/VK_PRValue,
+//       /* ExprObjectKind=*/OK_Ordinary, SourceLocation(),
+//       /* CanOverflow*/ false, FPOptionsOverride());
 
-  // Negation predicate.
-  UnaryOperator *FlagCheck = UnaryOperator::Create(
-      C,
-      /* input=*/
-      M.makeImplicitCast(M.makeLvalueToRvalue(Deref, DerefType), DerefType,
-                         CK_IntegralToBoolean),
-      /* opc=*/UO_LNot,
-      /* QualType=*/C.IntTy,
-      /* ExprValueKind=*/VK_PRValue,
-      /* ExprObjectKind=*/OK_Ordinary, SourceLocation(),
-      /* CanOverflow*/ false, FPOptionsOverride());
+//   // Create assignment.
+//   BinaryOperator *FlagAssignment = M.makeAssignment(
+//       Deref, M.makeIntegralCast(M.makeIntegerLiteral(1, C.IntTy), DerefType),
+//       DerefType);
 
-  // Create assignment.
-  BinaryOperator *FlagAssignment = M.makeAssignment(
-      Deref, M.makeIntegralCast(M.makeIntegerLiteral(1, C.IntTy), DerefType),
-      DerefType);
+//   auto *Out =
+//       IfStmt::Create(C, SourceLocation(), IfStatementKind::Ordinary,
+//                      /* Init=*/nullptr,
+//                      /* Var=*/nullptr,
+//                      /* Cond=*/FlagCheck,
+//                      /* LPL=*/SourceLocation(),
+//                      /* RPL=*/SourceLocation(),
+//                      /* Then=*/M.makeCompound({CallbackCall,
+//                      FlagAssignment}));
 
-  auto *Out =
-      IfStmt::Create(C, SourceLocation(), IfStatementKind::Ordinary,
-                     /* Init=*/nullptr,
-                     /* Var=*/nullptr,
-                     /* Cond=*/FlagCheck,
-                     /* LPL=*/SourceLocation(),
-                     /* RPL=*/SourceLocation(),
-                     /* Then=*/M.makeCompound({CallbackCall, FlagAssignment}));
-
-  return Out;
-}
+//   return Out;
+// }
 
 /// Create a fake body for dispatch_once.
-static Stmt *create_dispatch_once(ASTContext &C, const FunctionDecl *D) {
-  // Check if we have at least two parameters.
-  if (D->param_size() != 2)
-    return nullptr;
+// static Stmt *create_dispatch_once(ASTContext &C, const FunctionDecl *D) {
+//   // Check if we have at least two parameters.
+//   if (D->param_size() != 2)
+//     return nullptr;
 
-  // Check if the first parameter is a pointer to integer type.
-  const ParmVarDecl *Predicate = D->getParamDecl(0);
-  QualType PredicateQPtrTy = Predicate->getType();
-  const PointerType *PredicatePtrTy = PredicateQPtrTy->getAs<PointerType>();
-  if (!PredicatePtrTy)
-    return nullptr;
-  QualType PredicateTy = PredicatePtrTy->getPointeeType();
-  if (!PredicateTy->isIntegerType())
-    return nullptr;
+//   // Check if the first parameter is a pointer to integer type.
+//   const ParmVarDecl *Predicate = D->getParamDecl(0);
+//   QualType PredicateQPtrTy = Predicate->getType();
+//   const PointerType *PredicatePtrTy = PredicateQPtrTy->getAs<PointerType>();
+//   if (!PredicatePtrTy)
+//     return nullptr;
+//   QualType PredicateTy = PredicatePtrTy->getPointeeType();
+//   if (!PredicateTy->isIntegerType())
+//     return nullptr;
 
-  // Check if the second parameter is the proper block type.
-  const ParmVarDecl *Block = D->getParamDecl(1);
-  QualType Ty = Block->getType();
-  if (!isDispatchBlock(Ty))
-    return nullptr;
+//   // Check if the second parameter is the proper block type.
+//   const ParmVarDecl *Block = D->getParamDecl(1);
+//   QualType Ty = Block->getType();
+//   if (!isDispatchBlock(Ty))
+//     return nullptr;
 
-  // Everything checks out.  Create a fakse body that checks the predicate,
-  // sets it, and calls the block.  Basically, an AST dump of:
-  //
-  // void dispatch_once(dispatch_once_t *predicate, dispatch_block_t block) {
-  //  if (*predicate != ~0l) {
-  //    *predicate = ~0l;
-  //    block();
-  //  }
-  // }
+//   // Everything checks out.  Create a fakse body that checks the predicate,
+//   // sets it, and calls the block.  Basically, an AST dump of:
+//   //
+//   // void dispatch_once(dispatch_once_t *predicate, dispatch_block_t block) {
+//   //  if (*predicate != ~0l) {
+//   //    *predicate = ~0l;
+//   //    block();
+//   //  }
+//   // }
 
-  ASTMaker M(C);
+//   ASTMaker M(C);
 
-  // (1) Create the call.
-  CallExpr *CE = CallExpr::Create(
-      /*ASTContext=*/C,
-      /*StmtClass=*/M.makeLvalueToRvalue(/*Expr=*/Block),
-      /*Args=*/None,
-      /*QualType=*/C.VoidTy,
-      /*ExprValueType=*/VK_PRValue,
-      /*SourceLocation=*/SourceLocation(), FPOptionsOverride());
+//   // (1) Create the call.
+//   CallExpr *CE = CallExpr::Create(
+//       /*ASTContext=*/C,
+//       /*StmtClass=*/M.makeLvalueToRvalue(/*Expr=*/Block),
+//       /*Args=*/None,
+//       /*QualType=*/C.VoidTy,
+//       /*ExprValueType=*/VK_PRValue,
+//       /*SourceLocation=*/SourceLocation(), FPOptionsOverride());
 
-  // (2) Create the assignment to the predicate.
-  Expr *DoneValue =
-      UnaryOperator::Create(C, M.makeIntegerLiteral(0, C.LongTy), UO_Not,
-                            C.LongTy, VK_PRValue, OK_Ordinary, SourceLocation(),
-                            /*CanOverflow*/ false, FPOptionsOverride());
+//   // (2) Create the assignment to the predicate.
+//   Expr *DoneValue =
+//       UnaryOperator::Create(C, M.makeIntegerLiteral(0, C.LongTy), UO_Not,
+//                             C.LongTy, VK_PRValue, OK_Ordinary,
+//                             SourceLocation(),
+//                             /*CanOverflow*/ false, FPOptionsOverride());
 
-  BinaryOperator *B =
-    M.makeAssignment(
-       M.makeDereference(
-          M.makeLvalueToRvalue(
-            M.makeDeclRefExpr(Predicate), PredicateQPtrTy),
-            PredicateTy),
-       M.makeIntegralCast(DoneValue, PredicateTy),
-       PredicateTy);
+//   BinaryOperator *B = M.makeAssignment(
+//       M.makeDereference(
+//           M.makeLvalueToRvalue(M.makeDeclRefExpr(Predicate),
+//           PredicateQPtrTy), PredicateTy),
+//       M.makeIntegralCast(DoneValue, PredicateTy), PredicateTy);
 
-  // (3) Create the compound statement.
-  Stmt *Stmts[] = { B, CE };
-  CompoundStmt *CS = M.makeCompound(Stmts);
+//   // (3) Create the compound statement.
+//   Stmt *Stmts[] = {B, CE};
+//   CompoundStmt *CS = M.makeCompound(Stmts);
 
-  // (4) Create the 'if' condition.
-  ImplicitCastExpr *LValToRval =
-    M.makeLvalueToRvalue(
-      M.makeDereference(
-        M.makeLvalueToRvalue(
-          M.makeDeclRefExpr(Predicate),
-          PredicateQPtrTy),
-        PredicateTy),
-    PredicateTy);
+//   // (4) Create the 'if' condition.
+//   ImplicitCastExpr *LValToRval = M.makeLvalueToRvalue(
+//       M.makeDereference(
+//           M.makeLvalueToRvalue(M.makeDeclRefExpr(Predicate),
+//           PredicateQPtrTy), PredicateTy),
+//       PredicateTy);
 
-  Expr *GuardCondition = M.makeComparison(LValToRval, DoneValue, BO_NE);
-  // (5) Create the 'if' statement.
-  auto *If = IfStmt::Create(C, SourceLocation(), IfStatementKind::Ordinary,
-                            /* Init=*/nullptr,
-                            /* Var=*/nullptr,
-                            /* Cond=*/GuardCondition,
-                            /* LPL=*/SourceLocation(),
-                            /* RPL=*/SourceLocation(),
-                            /* Then=*/CS);
-  return If;
+//   Expr *GuardCondition = M.makeComparison(LValToRval, DoneValue, BO_NE);
+//   // (5) Create the 'if' statement.
+//   auto *If = IfStmt::Create(C, SourceLocation(), IfStatementKind::Ordinary,
+//                             /* Init=*/nullptr,
+//                             /* Var=*/nullptr,
+//                             /* Cond=*/GuardCondition,
+//                             /* LPL=*/SourceLocation(),
+//                             /* RPL=*/SourceLocation(),
+//                             /* Then=*/CS);
+//   return If;
+// }
+
+/// Ascend Stream Create Function:
+/// Signature: aclError aclrtCreateStream(aclrtStream *stream)
+/// aclError: int
+/// aclrtStream: void*
+///
+/// Fake impl:
+/// int aclrtCreateStream(void** stream) {
+///   extern void* alloc_stream_<id>();
+///   return ((*stream = alloc_stream()) == nullptr) ? 0 : 1;
+/// }
+static llvm::Optional<Stmt *> fake_acl_create_stream(ASTContext &C,
+                                                const FunctionDecl *D) {
+  // (1.1) extern alloc_stream<id> ();
+  auto *funcId =
+      &C.Idents.get("fakeAllocStream"); // TODO: 思考一下这里的内存管理思路
+  const ParmVarDecl *argTypeDecl = D->parameters()[0];
+  const QualType funcReturnTy = argTypeDecl->getType()->getPointeeType();
+
+  ASTMaker M{C};
+
+  // funcReturnTy here is 'void*', then we create function ptr type: 'void*
+  // (*)()'
+  auto funcPtrTy = C.getFunctionNoProtoType(funcReturnTy);
+  const FunctionDecl *externAllocStreamDecl = FunctionDecl::Create(
+      C, const_cast<DeclContext *>(D->getDeclContext()), SourceLocation(),
+      SourceLocation(), funcId, funcPtrTy, nullptr, SC_Extern);
+
+  // const QualType funcRetTy = externAllocStreamDecl->getReturnType();
+
+  // (1.2) Call FunctionDecl.
+  // (1.2.1) function ref
+  auto *funcRef = DeclRefExpr::Create(
+      C, NestedNameSpecifierLoc(), SourceLocation(),
+      const_cast<FunctionDecl *>(externAllocStreamDecl), false,
+      SourceLocation(), externAllocStreamDecl->getType().getNonReferenceType(),
+      VK_LValue);
+  // (1.2.2) Implicit cast: from void *() to void (*)()
+  auto *const funcPtr = ImplicitCastExpr::Create(
+      C, C.getPointerType(externAllocStreamDecl->getType()),
+      /* CastKind=*/CK_FunctionToPointerDecay,
+      /* Expr=*/funcRef,
+      /* CXXCastPath=*/nullptr,
+      /* ExprValueKind=*/VK_PRValue,
+      /* FPFeatures */ FPOptionsOverride());
+  // (1.2.3) CallExpr
+  auto *const callExpr =
+      CallExpr::Create(C, funcPtr, {}, funcReturnTy, VK_PRValue,
+                       SourceLocation(), FPOptionsOverride());
+
+  // (1.3) parameter ref.
+  auto *paramRef = M.makeLvalueToRvalue(D->getParamDecl(0));
+  // (1.3.1) Unaray Expr: *<param>
+  auto *writeToExpr = M.makeDereference(paramRef, paramRef->getType());
+
+  // (1.4) (*<param> = val)
+  auto *assignExpr = new (C) ParenExpr(
+      SourceLocation(), SourceLocation(),
+      M.makeAssignment(writeToExpr, callExpr, writeToExpr->getType()));
+
+  // (1.5) expr == nullptr
+  auto *NullPtr = new (C) CXXNullPtrLiteralExpr(C.NullPtrTy, SourceLocation());
+  auto *cond = M.makeComparison(assignExpr, NullPtr, BO_EQ);
+
+  // (1.6) expr ? 0 : 1
+  auto *checkNotNullExpr = new (C) ConditionalOperator(
+      cond, SourceLocation(), M.makeIntegerLiteral(0, C.IntTy),
+      SourceLocation(), M.makeIntegerLiteral(1, C.IntTy), C.IntTy, VK_PRValue,
+      OK_Ordinary);
+
+  return checkNotNullExpr;
 }
 
-/// Create a fake body for dispatch_sync.
-static Stmt *create_dispatch_sync(ASTContext &C, const FunctionDecl *D) {
-  // Check if we have at least two parameters.
-  if (D->param_size() != 2)
-    return nullptr;
-
-  // Check if the second parameter is a block.
-  const ParmVarDecl *PV = D->getParamDecl(1);
-  QualType Ty = PV->getType();
-  if (!isDispatchBlock(Ty))
-    return nullptr;
-
-  // Everything checks out.  Create a fake body that just calls the block.
-  // This is basically just an AST dump of:
-  //
-  // void dispatch_sync(dispatch_queue_t queue, void (^block)(void)) {
-  //   block();
-  // }
-  //
-  ASTMaker M(C);
-  DeclRefExpr *DR = M.makeDeclRefExpr(PV);
-  ImplicitCastExpr *ICE = M.makeLvalueToRvalue(DR, Ty);
-  CallExpr *CE = CallExpr::Create(C, ICE, None, C.VoidTy, VK_PRValue,
-                                  SourceLocation(), FPOptionsOverride());
-  return CE;
+static llvm::Optional<Stmt *> fake_pthread_create(ASTContext &C,
+                                                const FunctionDecl *D) {
+  // just return "return 0".
+  ASTMaker M{C};
+  return M.makeReturn(M.makeIntegerLiteral(0, C.IntTy));
 }
 
-static Stmt *create_OSAtomicCompareAndSwap(ASTContext &C, const FunctionDecl *D)
-{
-  // There are exactly 3 arguments.
-  if (D->param_size() != 3)
-    return nullptr;
+// static llvm::Optional<Stmt *> create_thread_construct(ASTContext &C, const
+// FunctionDecl *D) {
 
-  // Signature:
-  // _Bool OSAtomicCompareAndSwapPtr(void *__oldValue,
-  //                                 void *__newValue,
-  //                                 void * volatile *__theValue)
-  // Generate body:
-  //   if (oldValue == *theValue) {
-  //    *theValue = newValue;
-  //    return YES;
-  //   }
-  //   else return NO;
+//   // llvm::errs() << "create_thread_construct: faking: \n";
+//   // D->dump();
 
-  QualType ResultTy = D->getReturnType();
-  bool isBoolean = ResultTy->isBooleanType();
-  if (!isBoolean && !ResultTy->isIntegralType(C))
-    return nullptr;
+//   // TODO: for now we have no idea how to identify the correct one, so just
+//   limit arg number. if(D->getNumParams() != 2) return nullptr;
 
-  const ParmVarDecl *OldValue = D->getParamDecl(0);
-  QualType OldValueTy = OldValue->getType();
+//   llvm::errs() << "fake thread injected.\n";
+//
+//   ASTMaker M{C};
+//   const ParmVarDecl *funPtr = D->getParamDecl(0);
+//   const ParmVarDecl *arg = D->getParamDecl(1);
 
-  const ParmVarDecl *NewValue = D->getParamDecl(1);
-  QualType NewValueTy = NewValue->getType();
+//   // Create the call.
+//   CallExpr *CE = CallExpr::Create(
+//       /*ASTContext=*/C,
+//       /*StmtClass=*/M.makeLvalueToRvalue(funPtr),
+//       /*Args=*/M.makeLvalueToRvalue(arg),
+//       /*QualType=*/C.VoidTy,
+//       /*ExprValueType=*/VK_PRValue,
+//       /*SourceLocation=*/SourceLocation(), FPOptionsOverride());
 
-  assert(OldValueTy == NewValueTy);
+//   return CE;
+// }
 
-  const ParmVarDecl *TheValue = D->getParamDecl(2);
-  QualType TheValueTy = TheValue->getType();
-  const PointerType *PT = TheValueTy->getAs<PointerType>();
-  if (!PT)
-    return nullptr;
-  QualType PointeeTy = PT->getPointeeType();
+// /// Create a fake body for dispatch_sync.
+// static Stmt *create_dispatch_sync(ASTContext &C, const FunctionDecl *D) {
+//   // Check if we have at least two parameters.
+//   if (D->param_size() != 2)
+//     return nullptr;
 
-  ASTMaker M(C);
-  // Construct the comparison.
-  Expr *Comparison =
-    M.makeComparison(
-      M.makeLvalueToRvalue(M.makeDeclRefExpr(OldValue), OldValueTy),
-      M.makeLvalueToRvalue(
-        M.makeDereference(
-          M.makeLvalueToRvalue(M.makeDeclRefExpr(TheValue), TheValueTy),
-          PointeeTy),
-        PointeeTy),
-      BO_EQ);
+//   // Check if the second parameter is a block.
+//   const ParmVarDecl *PV = D->getParamDecl(1);
+//   QualType Ty = PV->getType();
+//   if (!isDispatchBlock(Ty))
+//     return nullptr;
 
-  // Construct the body of the IfStmt.
-  Stmt *Stmts[2];
-  Stmts[0] =
-    M.makeAssignment(
-      M.makeDereference(
-        M.makeLvalueToRvalue(M.makeDeclRefExpr(TheValue), TheValueTy),
-        PointeeTy),
-      M.makeLvalueToRvalue(M.makeDeclRefExpr(NewValue), NewValueTy),
-      NewValueTy);
+//   // Everything checks out.  Create a fake body that just calls the block.
+//   // This is basically just an AST dump of:
+//   //
+//   // void dispatch_sync(dispatch_queue_t queue, void (^block)(void)) {
+//   //   block();
+//   // }
+//   //
+//   ASTMaker M(C);
+//   DeclRefExpr *DR = M.makeDeclRefExpr(PV);
+//   ImplicitCastExpr *ICE = M.makeLvalueToRvalue(DR, Ty);
+//   CallExpr *CE = CallExpr::Create(C, ICE, None, C.VoidTy, VK_PRValue,
+//                                   SourceLocation(), FPOptionsOverride());
+//   return CE;
+// }
 
-  Expr *BoolVal = M.makeObjCBool(true);
-  Expr *RetVal = isBoolean ? M.makeIntegralCastToBoolean(BoolVal)
-                           : M.makeIntegralCast(BoolVal, ResultTy);
-  Stmts[1] = M.makeReturn(RetVal);
-  CompoundStmt *Body = M.makeCompound(Stmts);
+// static Stmt *create_OSAtomicCompareAndSwap(ASTContext &C, const FunctionDecl
+// *D)
+// {
+//   // There are exactly 3 arguments.
+//   if (D->param_size() != 3)
+//     return nullptr;
 
-  // Construct the else clause.
-  BoolVal = M.makeObjCBool(false);
-  RetVal = isBoolean ? M.makeIntegralCastToBoolean(BoolVal)
-                     : M.makeIntegralCast(BoolVal, ResultTy);
-  Stmt *Else = M.makeReturn(RetVal);
+//   // Signature:
+//   // _Bool OSAtomicCompareAndSwapPtr(void *__oldValue,
+//   //                                 void *__newValue,
+//   //                                 void * volatile *__theValue)
+//   // Generate body:
+//   //   if (oldValue == *theValue) {
+//   //    *theValue = newValue;
+//   //    return YES;
+//   //   }
+//   //   else return NO;
 
-  /// Construct the If.
-  auto *If =
-      IfStmt::Create(C, SourceLocation(), IfStatementKind::Ordinary,
-                     /* Init=*/nullptr,
-                     /* Var=*/nullptr, Comparison,
-                     /* LPL=*/SourceLocation(),
-                     /* RPL=*/SourceLocation(), Body, SourceLocation(), Else);
+//   QualType ResultTy = D->getReturnType();
+//   bool isBoolean = ResultTy->isBooleanType();
+//   if (!isBoolean && !ResultTy->isIntegralType(C))
+//     return nullptr;
 
-  return If;
-}
+//   const ParmVarDecl *OldValue = D->getParamDecl(0);
+//   QualType OldValueTy = OldValue->getType();
+
+//   const ParmVarDecl *NewValue = D->getParamDecl(1);
+//   QualType NewValueTy = NewValue->getType();
+
+//   assert(OldValueTy == NewValueTy);
+
+//   const ParmVarDecl *TheValue = D->getParamDecl(2);
+//   QualType TheValueTy = TheValue->getType();
+//   const PointerType *PT = TheValueTy->getAs<PointerType>();
+//   if (!PT)
+//     return nullptr;
+//   QualType PointeeTy = PT->getPointeeType();
+
+//   ASTMaker M(C);
+//   // Construct the comparison.
+//   Expr *Comparison =
+//     M.makeComparison(
+//       M.makeLvalueToRvalue(M.makeDeclRefExpr(OldValue), OldValueTy),
+//       M.makeLvalueToRvalue(
+//         M.makeDereference(
+//           M.makeLvalueToRvalue(M.makeDeclRefExpr(TheValue), TheValueTy),
+//           PointeeTy),
+//         PointeeTy),
+//       BO_EQ);
+
+//   // Construct the body of the IfStmt.
+//   Stmt *Stmts[2];
+//   Stmts[0] =
+//     M.makeAssignment(
+//       M.makeDereference(
+//         M.makeLvalueToRvalue(M.makeDeclRefExpr(TheValue), TheValueTy),
+//         PointeeTy),
+//       M.makeLvalueToRvalue(M.makeDeclRefExpr(NewValue), NewValueTy),
+//       NewValueTy);
+
+//   Expr *BoolVal = M.makeObjCBool(true);
+//   Expr *RetVal = isBoolean ? M.makeIntegralCastToBoolean(BoolVal)
+//                            : M.makeIntegralCast(BoolVal, ResultTy);
+//   Stmts[1] = M.makeReturn(RetVal);
+//   CompoundStmt *Body = M.makeCompound(Stmts);
+
+//   // Construct the else clause.
+//   BoolVal = M.makeObjCBool(false);
+//   RetVal = isBoolean ? M.makeIntegralCastToBoolean(BoolVal)
+//                      : M.makeIntegralCast(BoolVal, ResultTy);
+//   Stmt *Else = M.makeReturn(RetVal);
+
+//   /// Construct the If.
+//   auto *If =
+//       IfStmt::Create(C, SourceLocation(), IfStatementKind::Ordinary,
+//                      /* Init=*/nullptr,
+//                      /* Var=*/nullptr, Comparison,
+//                      /* LPL=*/SourceLocation(),
+//                      /* RPL=*/SourceLocation(), Body, SourceLocation(),
+//                      Else);
+
+//   return If;
+// }
 
 Stmt *BodyFarm::getBody(const FunctionDecl *D) {
   Optional<Stmt *> &Val = Bodies[D];
@@ -672,29 +782,43 @@ Stmt *BodyFarm::getBody(const FunctionDecl *D) {
 
   Val = nullptr;
 
-  if (D->getIdentifier() == nullptr)
-    return nullptr;
+  StringRef Name;
 
-  StringRef Name = D->getName();
+  if (D->getIdentifier() == nullptr)
+    // return nullptr;
+    Name = StringRef{D->getDeclName().getAsString()};
+  else {
+    Name = D->getName();
+  }
+
+  // llvm::errs() << "CURRENT NAME: " << Name << "\n";
+
   if (Name.empty())
     return nullptr;
 
   FunctionFarmer FF;
 
-  if (Name.startswith("OSAtomicCompareAndSwap") ||
-      Name.startswith("objc_atomicCompareAndSwap")) {
-    FF = create_OSAtomicCompareAndSwap;
-  } else if (Name == "call_once" && D->getDeclContext()->isStdNamespace()) {
-    FF = create_call_once;
-  } else {
-    FF = llvm::StringSwitch<FunctionFarmer>(Name)
-          .Case("dispatch_sync", create_dispatch_sync)
-          .Case("dispatch_once", create_dispatch_once)
-          .Default(nullptr);
-  }
+  // if (Name.startswith("OSAtomicCompareAndSwap") ||
+  //     Name.startswith("objc_atomicCompareAndSwap")) {
+  //   FF = create_OSAtomicCompareAndSwap;
+  // } else if (Name == "call_once" && D->getDeclContext()->isStdNamespace()) {
+  //   FF = create_call_once;
+  // } else {
+  FF = llvm::StringSwitch<FunctionFarmer>(Name)
+           // .Case("dispatch_sync", create_dispatch_sync)
+           // .Case("dispatch_once", create_dispatch_once)
+           // .Case("thread", create_thread_construct)
+           .Case("aclrtCreateStream", fake_acl_create_stream)
+           .Case("pthread_create", fake_pthread_create)
+           .Default(nullptr);
+  // }
 
-  if (FF) { Val = FF(C, D); }
-  else if (Injector) { Val = Injector->getBody(D); }
+  if (FF) {
+    Val = FF(C, D);
+  }
+  // else if (Injector) { Val = Injector->getBody(D); }
+  else
+    return nullptr;
   return Val.getValue();
 }
 
