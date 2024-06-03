@@ -4895,6 +4895,10 @@ def analyzer_disable_all_checks : Flag<["-"], "analyzer-disable-all-checks">,
   HelpText<"Disable all static analyzer checks">,
   MarshallingInfoFlag<AnalyzerOpts<"DisableAllCheckers">>;
 
+def analyzer_enable_class_helper_injection : Flag<["-"], "analyzer-enable-class-helper-injection">,
+  HelpText<"Disable all static analyzer checks">,
+  MarshallingInfoFlag<AnalyzerOpts<"EnableClassHelperInjection">>;
+
 def analyzer_checker_help : Flag<["-"], "analyzer-checker-help">,
   HelpText<"Display the list of analyzer checkers that are available">,
   MarshallingInfoFlag<AnalyzerOpts<"ShowCheckerHelp">>;
