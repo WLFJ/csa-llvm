@@ -650,7 +650,6 @@ void AnalysisConsumer::HandleTranslationUnit(ASTContext &C) {
         // HD->dump();
 
         RD->addDecl(HD);
-        ClassHelpMethods.emplace_back(HD);
       }
     }
   }
